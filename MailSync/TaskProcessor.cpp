@@ -344,6 +344,29 @@ void _applyLabelChangeInIMAPFolder(IMAPSession * session, String * path, IndexSe
     }
 }
 
+// A task whose JSON has (say) a null where we expect a string throws json::type_error,
+// which isn't a SyncException and used to reach the worker's `catch (...) { abort(); }`,
+// leaving the row at status=remote to kill the next launch too. Fail the task instead
+// so it drains — the client reports this through Task.onError().
+static json errorJSONForUnexpectedException(string what) {
+    // Goes into the task's data JSON, which MailStore dumps to SQLite, and dump()
+    // throws on invalid UTF-8 — so scrub to printable ASCII.
+    string safe;
+    safe.reserve(what.size());
+    for (char c : what) {
+        safe += (c >= 0x20 && c <= 0x7E) ? c : '?';
+    }
+    if (safe.size() > 1024) {
+        safe.resize(1024);
+    }
+    return {
+        {"what", safe},
+        {"key", "unhandled-exception"},
+        {"debuginfo", safe},
+        {"retryable", false},
+        {"offline", false},
+    };
+}
 
 TaskProcessor::TaskProcessor(shared_ptr<Account> account, MailStore * store, IMAPSession * session) :
     account(account),
@@ -496,8 +519,29 @@ void TaskProcessor::performLocal(Task * task) {
         logger->flush();
         task->setError(ex.toJSON());
         task->setStatus("complete");
+
+    } catch (SQLite::Exception & ex) {
+        // Database errors are usually transient (another mailsync process holding a
+        // lock, a busy disk) and say nothing about whether this task is runnable, so
+        // keep the existing behavior: leave the task as-is and let it escape, rather
+        // than discarding work the user asked for on a problem that will clear.
+        logger->error("[{}] -- Database error, not marking the task complete: {}", task->id(), ex.what());
+        logger->flush();
+        throw;
+
+    } catch (std::exception & ex) {
+        logger->error("[{}] -- Failed with an unexpected exception ({}). Changing status to `complete`", task->id(), ex.what());
+        logger->flush();
+        task->setError(errorJSONForUnexpectedException(ex.what()));
+        task->setStatus("complete");
+
+    } catch (...) {
+        logger->error("[{}] -- Failed with an unknown exception. Changing status to `complete`", task->id());
+        logger->flush();
+        task->setError(errorJSONForUnexpectedException("Unknown exception"));
+        task->setStatus("complete");
     }
-    
+
     store->save(task);
 }
 
@@ -605,6 +649,25 @@ void TaskProcessor::performRemote(Task * task) {
         logger->error("[{}] -- Failed ({}). Changing status to `complete`", task->id(), ex.toJSON().dump());
         logger->flush();
         task->setError(ex.toJSON());
+        task->setStatus("complete");
+
+    } catch (SQLite::Exception & ex) {
+        // See the note in performLocal: a database error is not the task's fault, so
+        // let it escape and leave the task queued for the next pass / next launch.
+        logger->error("[{}] -- Database error, not marking the task complete: {}", task->id(), ex.what());
+        logger->flush();
+        throw;
+
+    } catch (std::exception & ex) {
+        logger->error("[{}] -- Failed with an unexpected exception ({}). Changing status to `complete`", task->id(), ex.what());
+        logger->flush();
+        task->setError(errorJSONForUnexpectedException(ex.what()));
+        task->setStatus("complete");
+
+    } catch (...) {
+        logger->error("[{}] -- Failed with an unknown exception. Changing status to `complete`", task->id());
+        logger->flush();
+        task->setError(errorJSONForUnexpectedException("Unknown exception"));
         task->setStatus("complete");
     }
     store->save(task);
@@ -1270,14 +1333,11 @@ void TaskProcessor::performRemoteSyncbackEvent(Task * task) {
 }
 
 void TaskProcessor::performLocalDestroyEvent(Task * task) {
-    vector<string> eventIds {};
-    for (json & e : task->data()["events"]) {
-        eventIds.push_back(e["id"].get<string>());
-    }
-
-    // Mark events as hidden locally (they'll be fully removed after remote delete succeeds)
-    // Note: Unlike contacts, we don't have a "hidden" field on events, so we just
-    // leave them in place until performRemote completes.
+    // Nothing to do locally. Removing the rows here would mean the calendar updated a moment
+    // sooner, at the cost of a delete that cannot be undone if the server refuses it: the
+    // collection's ctag is unchanged by a failed DELETE, so runCalendars() skips it and no
+    // later sync restores what was removed. The rows go in performRemote once the server has
+    // accepted, and DestroyEventTask refreshes the calendar on success.
 }
 
 void TaskProcessor::performRemoteDestroyEvent(Task * task) {
@@ -1286,11 +1346,47 @@ void TaskProcessor::performRemoteDestroyEvent(Task * task) {
         eventIds.push_back(e["id"].get<string>());
     }
 
-    auto events = store->findLargeSet<Event>("id", eventIds);
-    auto dav = make_shared<DAVWorker>(account);
+    // findLargeSet chunks through MailUtils::chunksOfVector, which erases from the vector it
+    // is handed, so eventIds is empty once the lookup returns. Read the count before the call
+    // or this compares against zero and warns on every successful delete.
+    const size_t requested = eventIds.size();
 
+    auto events = store->findLargeSet<Event>("id", eventIds);
+    if (events.size() != requested) {
+        logger->warn("Destroying {} of {} requested events; the rest are no longer present",
+                     events.size(), requested);
+    }
+
+    auto dav = make_shared<DAVWorker>(account);
+    // One event that cannot be deleted must not strand the rest: performLocalDestroyEvent is
+    // deliberately a no-op, so this loop is the only thing that removes any of these rows.
+    // A 404 or 410 against the href the server itself reported means the resource is already
+    // gone, which is the outcome asked for: drop the local row and carry on. Against an href
+    // guessed from the UID it means only that the guess was wrong, and the resource may well
+    // still exist, so that stays a failure.
+    vector<SyncException> failures {};
     for (auto & event : events) {
-        dav->deleteEvent(event);
+        try {
+            dav->deleteEvent(event);
+        } catch (SyncException & ex) {
+            bool gone = ex.key.find("404") != string::npos || ex.key.find("410") != string::npos;
+            if (gone && !event->href().empty()) {
+                logger->info("Event {} was already gone from the server; removing locally", event->id());
+                store->remove(event.get());
+                continue;
+            }
+            logger->error("Could not delete event {}: {}", event->id(), ex.toJSON().dump());
+            failures.push_back(ex);
+        }
+    }
+    if (failures.size() == 1) {
+        throw failures.front(); // the reason itself, not a count, when there is only one
+    }
+    if (!failures.empty()) {
+        throw SyncException("delete-failed",
+                            "Could not delete " + to_string(failures.size()) + " of " +
+                                to_string(events.size()) + " events; first: " + failures.front().key,
+                            false);
     }
 }
 
