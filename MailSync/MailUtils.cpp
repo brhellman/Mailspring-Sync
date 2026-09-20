@@ -19,6 +19,8 @@
 #include "Account.hpp"
 #include "Query.hpp"
 
+#include <random>
+
 #if defined(_MSC_VER)
 #include <direct.h>
 #include <codecvt>
@@ -57,8 +59,6 @@ static vector<string> unworthyPrefixes = {
     "catchall",
     "catch-all"
 };
-
-static bool calledsrand = false;
 
 bool create_directory(string dir) {
     int c = 0;
@@ -506,8 +506,10 @@ vector<Query> MailUtils::queriesForUIDRangesInIndexSet(string remoteFolderId, In
             // this range has a * upper bound, we need to represent it as a "uid > X" query.
             results.push_back(Query().equal("remoteFolderId", remoteFolderId).gte("remoteUID", left));
         } else if (right - left > 50) {
-            // this range has many items, just express it as a bounded range query
-            results.push_back(Query().equal("remoteFolderId", remoteFolderId).gte("remoteUID", left).lt("remoteUID", right));
+            // this range has many items, just express it as a bounded range query. Both ends
+            // are inclusive because IndexSet ranges are. It has to be one BETWEEN clause -
+            // Query keys clauses by column, so chaining gte() and lte() drops the lower bound.
+            results.push_back(Query().equal("remoteFolderId", remoteFolderId).betweenInclusive("remoteUID", left, right));
         } else {
             // this range has a few items, throw them in a pile and we'll make a few queries for these specific UIDs
             for (uint64_t x = left; x <= right; x ++) {
@@ -566,16 +568,18 @@ string MailUtils::idForFile(Message * message, Attachment * attachment) {
 }
 
 string MailUtils::idRandomlyGenerated() {
-    static string charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890";
+    static const string charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890";
+    // One generator per thread, seeded from the OS entropy source. Mailspring runs one mailsync
+    // process per account against a shared database, and Contact / ContactGroup use these IDs as
+    // their sole primary key - a time-seeded generator produced identical ID streams in two
+    // processes launched in the same second, and the second insert died on a UNIQUE violation.
+    static thread_local std::mt19937 generator{std::random_device{}()};
+    std::uniform_int_distribution<size_t> pick(0, charset.length() - 1);
+
     string result;
     result.resize(40);
-    
-    if (!calledsrand) {
-        srand((unsigned int)time(0));
-        calledsrand = true;
-    }
     for (int i = 0; i < 40; i++) {
-        result[i] = charset[rand() % charset.length()];
+        result[i] = charset[pick(generator)];
     }
     return result;
 }
