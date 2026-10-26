@@ -11,6 +11,10 @@ env:
   VCPKG_DEFAULT_HOST_TRIPLET: x86-windows
   # Use overlay port for cyrus-sasl without krb5 (krb5 doesn't support x86-windows)
   VCPKG_OVERLAY_PORTS: ${{ github.workspace }}/vcpkg-overlay-ports
+  # Set here, before run-vcpkg, which otherwise sets this to the x-gha provider that vcpkg has
+  # removed ("The 'x-gha' binary caching backend has been removed"), leaving every run to compile
+  # all 30 packages from source. vcpkg-cache/ is restored and saved by the cache steps below.
+  VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}\vcpkg-cache\archives,readwrite
 
 jobs:
   build-windows:
@@ -29,19 +33,37 @@ jobs:
           vcpkgGitCommitId: '84bab45d415d22042bd0b9081aea57f362da3f35'
           # Don't run vcpkg install here - let MSBuild handle it with manifest mode
           runVcpkgInstall: false
-          # Disable deprecated x-gha binary caching (was removed from vcpkg)
+          # run-vcpkg's own cache holds only the vcpkg checkout; packages are cached below
           doNotCache: true
 
       - name: Enable vcpkg MSBuild integration
         run: vcpkg integrate install
 
-      # Cache packages installed by MSBuild's vcpkg manifest mode
-      # MSBuild with VcpkgEnableManifest=true installs to vcpkg_installed/ next to vcpkg.json
-      - name: Restore vcpkg packages cache
-        uses: actions/cache@v6
+      # Source tarballs and tool downloads are mirrored next to the built packages, so a rebuild
+      # (new compiler on the runner image, a bumped port) does not fetch them again, and a fetch
+      # that is needed retries with backoff: git.openldap.org rate-limits the runners' shared
+      # addresses and answered 429 for lmdb in 7 of the 30 runs before this. The mirror path is
+      # an argument because vcpkg runs the script in a cleaned environment.
+      - name: Point vcpkg at the source mirror
+        shell: pwsh
+        run: |
+          $cache = "$env:GITHUB_WORKSPACE\vcpkg-cache"
+          New-Item -ItemType Directory -Force -Path "$cache\archives", "$cache\assets" | Out-Null
+          $script = "$env:GITHUB_WORKSPACE\.github\scripts\vcpkg-fetch-asset.ps1"
+          "X_VCPKG_ASSET_SOURCES=clear;x-script,powershell -NoProfile -ExecutionPolicy Bypass -File $script $cache\assets {url} {sha512} {dst}" >> $env:GITHUB_ENV
+
+      # The key ends in the run id so every run saves what it added; restore-keys picks up the
+      # newest cache for the same manifests, then any older one (vcpkg rebuilds only what the
+      # ABI hash says has changed).
+      - name: Restore vcpkg packages and source tarballs
+        id: vcpkg-cache
+        uses: actions/cache/restore@v6
         with:
-          path: vcpkg_installed
-          key: vcpkg-msbuild-x86-windows-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'vcpkg-overlay-ports/**') }}
+          path: vcpkg-cache
+          key: vcpkg-x86-windows-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'vcpkg-overlay-ports/**') }}-${{ github.run_id }}
+          restore-keys: |
+            vcpkg-x86-windows-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'vcpkg-overlay-ports/**') }}-
+            vcpkg-x86-windows-
 
       - name: Set commit hash
         shell: pwsh
@@ -63,6 +85,15 @@ jobs:
           cd Windows
           REM VcpkgEnableManifest=true tells MSBuild to install packages from vcpkg.json to vcpkg_installed/
           msbuild.exe mailsync.sln /property:Configuration=Release;Platform=Win32 /p:VcpkgEnableManifest=true
+
+      # Saved even when the build fails, so a run that was rate-limited on one tarball still keeps
+      # the packages it did build for the next run.
+      - name: Save vcpkg packages and source tarballs
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: vcpkg-cache
+          key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
 
       - name: Copy build artifacts and dependencies
         shell: pwsh
